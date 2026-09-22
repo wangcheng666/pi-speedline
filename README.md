@@ -2,7 +2,7 @@
 
 **A unified speedometer for the [pi](https://pi.dev) coding agent.**
 
-Real-time calibrated tokens/s while streaming, exact per-turn TTFT and
+Real-time calibrated tokens/s while streaming, exact per-round TTFT and
 throughput when done — merged into ONE conflict-free footer slot with a
 curated, theme-adaptive palette.
 
@@ -28,21 +28,24 @@ One status slot (`speed`), one layout in every phase
 | No previous data (fresh session) | `⚡ TTFT – ↓– –t/s` (ghost) |
 | Streaming (live estimate) | `⚡ TTFT 312ms ↓128 ~42t/s` |
 | Message done → **tool (bash) execution** → next segment waiting | `⚡ TTFT 312ms ↓456 78.9t/s` (exact, held) |
-| Aborted turn | `⚡ ↓83 interrupted` |
-| Turn with zero output | `⚡ TTFT – ↓– –t/s` (warning ghost) |
+| Aborted round | `⚡ ↓83 interrupted` |
+| Round with zero output | `⚡ TTFT – ↓– –t/s` (warning ghost) |
 
 Design decisions:
 
 - **No "streaming…" placeholder state** — the first token immediately
   shows live numbers.
-- **Keep-last-display**: a new turn never blanks the slot; the next
-  segment's first delta jumps straight to live. Same logic between turns
-  and between conversation rounds.
-- **Exact values as soon as they exist**: the final line is rendered at
-  `message_end` (a pi turn = one LLM response + its tool calls), so it
-  stays on screen while bash runs — not a frozen `~` estimate.
-- **Per-turn stats are independent** — each turn's numbers come only from
-  that turn's own stream (covered by regression assertions in the test).
+- **Keep-last-display**: a new round never blanks the slot; its first
+  delta jumps straight to live.
+- **Exact values as soon as they exist**: the exact line is rendered at
+  every `message_end`. A round (one user prompt) can contain SEVERAL
+  LLM calls — pi's internal "turn" is one call + its tool batch — and
+  the stats span the whole round, so the display stays exact while bash
+  runs and until the round's next call streams, never a frozen `~`
+  estimate.
+- **Per-round stats are independent** — each round's numbers come only
+  from that round's own stream (covered by regression assertions in the
+  test).
 
 ## Palette — "Amber & Jade"
 
@@ -83,10 +86,14 @@ converge, so the footer never shows two contradictory numbers:
   total drift is ≥10% (e.g. after switching models/providers).
 - **Live rate** — token-weighted rolling 2 s window (falls back to the
   whole-message average for very short windows).
-- **Final rate** — exact output tokens (text + thinking + tool-call
-  tokens, matching `usage.output`) ÷ exact stream span (first → last
-  delta).
-- **TTFT** — turn start → first token delta.
+- **Final rate** — exact round output tokens (text + thinking +
+  tool-call tokens, matching `usage.output`) ÷ pure streaming time (sum
+  of each message's first→last delta span; tool runs and inter-call
+  gaps are excluded, matching what the live rate measures).
+- **TTFT** — request dispatch (the round's first assistant
+  `message_start`) → first token. Local pre-request pipeline time
+  (extension hooks, compaction, queueing) is deliberately excluded —
+  that is not "waiting for the model".
 
 Result: first message of a session carries the prior (±20% for CJK),
 after one calibration round typical error is <5% — even across ratio
@@ -129,9 +136,12 @@ npm run typecheck
 ```
 
 The simulation builds a self-consistent tokenization world (CJK 2.0
-chars/token, latin 4.0) and asserts: live-vs-final convergence, ratio
-flips, per-turn independence, tool-phase exact display, keep-last-display,
-and skeleton/restore behavior.
+chars/token, latin 4.0) and replays the REAL pi 0.87.0 event stream
+(`agent_start` … `turn_start` … `message_start` … tool runs … `agent_end`).
+It asserts: live-vs-final convergence, ratio flips, per-round
+independence, multi-call rounds (no mid-round reset), tool-phase exact
+display, TTFT anchored at request dispatch (local pipeline excluded),
+keep-last-display, and skeleton/restore behavior.
 
 ## Credits
 
@@ -153,12 +163,15 @@ pi 的统一速度表:流式输出时显示**校准后的实时 tokens/s**,输�
 字符/token),消息结束后用真实 `usage.output` 做**双系数残差校准**
 (`k_cjk` / `k_latin`)——思考(英文)和回答(中文)比例怎么翻转都不会互相
 干扰,一条消息后误差通常 <5%。实时速率是 2 秒滚动窗口(带 `~`),最终
-速率 = 真实 output token ÷ 真实流式时长。
+速率 = 整轮真实 output token ÷ 纯流式时长(工具执行和调用间隙不算)。
+**TTFT = 请求实际发出(首个 assistant message_start)→ 首 token**,不含
+本地预处理(扩展钩子/压缩)时间——那不是在等模型。
 
-**显示逻辑**:槽位常驻不空(无数据显示幽灵字段占位);消息完成即渲染
-精确终值,bash 工具执行期间保持不动;新 turn 不清屏,首 token 直接跳
-实时。每轮统计完全独立,不累计。零定时器实现,无 stale-ctx 崩溃风险
-(原 `pi-tokens-per-second` 的崩溃原因)。
+**显示逻辑**:槽位常驻不空(无数据显示幽灵字段占位);每条消息完成即渲染
+精确值,bash 执行期间保持不动,轮内多次 LLM 调用(如思考→跑命令→总结)
+统计累加不清零;新一轮不清屏,首 token 直接跳实时。每轮统计完全独立,
+不跨轮累计。零定时器实现,无 stale-ctx 崩溃风险(原
+`pi-tokens-per-second` 的崩溃原因)。
 
 ```bash
 pi install npm:pi-speedline    # 安装

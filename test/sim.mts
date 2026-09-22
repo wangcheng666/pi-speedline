@@ -1,14 +1,33 @@
 /**
  * Event-sequence simulation for pi-speedline.
  *
- * Self-consistent tokenization world:
- *   CJK  = 2.0 chars/token  (Qwen-class chinese)
- *   latin = 4.0 chars/token (english thinking / code)
+ * Models the REAL pi 0.87.0 event stream (verified with a probe
+ * extension against a live pi session):
+ *   agent_start                      ← user prompt submitted (round start)
+ *   [local pipeline: hooks, compaction — NOT part of TTFT]
+ *   turn_start idx=0                 ← pi "turn" = ONE LLM call + tool batch
+ *   message_start (assistant)        ← request dispatched (TTFT anchor)
+ *   message_update (deltas) …
+ *   message_end (assistant)
+ *   tool_execution_start/end         ← bash runs (inside the round)
+ *   turn_end
+ *   turn_start idx=1                 ← next LLM call, SAME round
+ *   message_start (assistant)
+ *   …
+ *   agent_end                        ← round over
  *
- * Verifies: dual-class calibration (k_cjk / k_latin), the realistic
- * "english thinking + chinese answer" pattern, and — the key case —
- * the thinking:answer ratio FLIPPING between messages, which a single
- * global factor cannot track.
+ * Self-consistent tokenization world:
+ *   CJK  = 2.0 chars/token (delta "汉字" = 1 token)
+ *   latin = 4.0 chars/token (delta "abcd" = 1 token)
+ *
+ * Regression assertions:
+ *   A1  TTFT is anchored at the first assistant message_start of the
+ *       round — NOT at agent_start (local pipeline time excluded)
+ *   A2  a multi-call round accumulates (no mid-round wipe)
+ *   A3  exact values shown while tools run; live count never drops
+ *   A4  per-round independence (no cross-round accumulation)
+ *   A5  aborted round shows partial usage as "interrupted"
+ *   A6  display kept across rounds; first delta jumps straight to live
  *
  * Run: node --experimental-strip-types test/sim.mts
  */
@@ -28,12 +47,14 @@ const pi: any = {
 piSpeedline(pi);
 
 let lastStatus: string | null = null;
+const writes: string[] = [];
 const plain = (s: string | null) => (s ?? "").replace(/\x1b\[[0-9;]*m/g, "");
 const ctx: any = {
 	hasUI: true,
 	ui: {
 		setStatus: (k: string, t: string) => {
 			lastStatus = t;
+			writes.push(t);
 		},
 		notify: (t: string) => console.log("  notify:", t),
 		// bright text color ⇒ simulated dark terminal background
@@ -48,6 +69,25 @@ const ctx: any = {
 const emit = (ev: string, event: any) => handlers[ev]?.(event, ctx);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const show = (s: string | null) => plain(s);
+const downTok = (s: string | null) => {
+	const m = s?.match(/↓(\d+)/);
+	return m ? parseInt(m[1], 10) : null;
+};
+const ttftMs = (s: string | null) => {
+	const m = s?.match(/TTFT (\d+)ms/);
+	return m ? parseInt(m[1], 10) : null;
+};
+
+let failed = 0;
+const check = (label: string, got: number | null, want: number, tol = 0) => {
+	const ok = got !== null && Math.abs(got - want) <= tol;
+	if (!ok) failed++;
+	console.log(`[assert] ${label}: ${got} (want ${want}${tol ? `±${tol}` : ""}) ${ok ? "PASS" : "FAIL"}`);
+};
+const checkTrue = (label: string, ok: boolean, detail = "") => {
+	if (!ok) failed++;
+	console.log(`[assert] ${label} ${ok ? "PASS" : `FAIL ${detail}`}`);
+};
 
 const mkAssistant = (output = 0, stopReason = "stop") => ({
 	role: "assistant",
@@ -56,38 +96,75 @@ const mkAssistant = (output = 0, stopReason = "stop") => ({
 	usage: { input: 100, output, cacheRead: 0, cacheWrite: 0, totalTokens: 100 + output },
 });
 
+async function delta(type: "thinking_delta" | "text_delta" | "toolcall_delta", delta: string) {
+	await emit("message_update", {
+		message: mkAssistant(),
+		assistantMessageEvent: { type, contentIndex: 0, delta, partial: {} },
+	});
+}
+
 /**
- * Simulate one LLM turn made of `thinking` latin deltas ("abcd", 4 chars =
- * 1 token) followed by `answer` CJK deltas ("汉字", 2 chars = 1 token),
- * spaced `stepMs` apart, ending with real usage = thinking + answer tokens.
+ * One LLM call: message_start → `thinking` latin deltas → `answer` CJK
+ * deltas (stepMs apart) → message_end with real usage = thinking+answer.
+ * Returns exact wall-clock anchors (same Date.now clock as the extension).
  */
-async function simulateTurn(label: string, thinking: number, answer: number, stepMs: number) {
-	await emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
-	const waiting = lastStatus;
+async function simulateCall(thinking: number, answer: number, stepMs: number, stopReason: string) {
+	const tMsgStart = Date.now();
 	await emit("message_start", { message: mkAssistant() });
+	await sleep(stepMs);
+	const tFirstDelta = Date.now();
 	for (let i = 0; i < thinking; i++) {
-		await new Promise((r) => setTimeout(r, stepMs));
-		await emit("message_update", {
-			message: mkAssistant(),
-			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "abcd", partial: {} },
-		});
+		await delta("thinking_delta", "abcd");
+		await sleep(stepMs);
 	}
 	for (let i = 0; i < answer; i++) {
-		await new Promise((r) => setTimeout(r, stepMs));
-		await emit("message_update", {
-			message: mkAssistant(),
-			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "汉字", partial: {} },
-		});
+		await delta("text_delta", "汉字");
+		await sleep(stepMs);
 	}
 	const live = lastStatus;
 	const real = thinking + answer;
-	await emit("message_end", { message: mkAssistant(real, "toolUse") });
-	const duringTools = lastStatus; // this is what stays on screen while bash runs
-	await emit("turn_end", { turnIndex: 1, message: mkAssistant(real), outcome: "completed", toolResults: [] });
+	await emit("message_end", { message: mkAssistant(real, stopReason) });
+	return { tMsgStart, tFirstDelta, live, during: lastStatus };
+}
+
+interface CallSpec {
+	thinking: number;
+	answer: number;
+	stepMs?: number;
+	stopReason?: string;
+	toolMs?: number; // bash runs after this call
+}
+
+/** One full round (agent_start … agent_end), any number of LLM calls. */
+async function simulateRound(label: string, calls: CallSpec[], preRequestGapMs = 0) {
+	writes.length = 0;
+	const tAgentStart = Date.now();
+	await emit("agent_start", {});
+	const roundMsgs: any[] = [];
+	let duringTools: string | null = null;
+	for (const c of calls) {
+		await emit("turn_start", { turnIndex: 0, timestamp: Date.now() }); // must be ignored
+		const r = await simulateCall(
+			c.thinking,
+			c.answer,
+			c.stepMs ?? 20,
+			c.stopReason ?? "stop",
+		);
+		roundMsgs.push(mkAssistant(c.thinking + c.answer, c.stopReason ?? "stop"));
+		if (c.toolMs) {
+			await emit("tool_execution_start", { toolName: "bash" });
+			await sleep(c.toolMs);
+			await emit("tool_execution_end", { toolName: "bash" });
+			duringTools = lastStatus;
+		}
+		await emit("turn_end", { turnIndex: 0, message: roundMsgs[roundMsgs.length - 1], outcome: "completed", toolResults: [] });
+	}
+	await emit("agent_end", { messages: roundMsgs });
+	const total = calls.reduce((s, c) => s + c.thinking + c.answer, 0);
 	console.log(
-		`[${label}] thk:${String(thinking).padStart(3)} ans:${String(answer).padStart(3)} | live: ${show(live).padEnd(24)} | during-tools: ${show(duringTools).padEnd(24)} | final: ${show(lastStatus)}`,
+		`[${label}] calls:${calls.length} ↓${String(total).padStart(3)} | during-tools: ${show(duringTools ?? "–").padEnd(26)} | final: ${show(lastStatus)}`,
 	);
-	return { live, duringTools, final: lastStatus };
+	return { tAgentStart, final: lastStatus, duringTools, writes: writes.slice() };
 }
 
 console.log("=== pi-speedline simulation (world: CJK 2.0 ch/tok, latin 4.0 ch/tok) ===\n");
@@ -96,166 +173,126 @@ console.log("=== pi-speedline simulation (world: CJK 2.0 ch/tok, latin 4.0 ch/to
 await emit("session_start", { reason: "startup" });
 console.log(`[idle  ] session_start skeleton      | ${lastStatus}\n`);
 
-// 1) chinese answer only (thinking off)
-await simulateTurn("zh-t1", 0, 100, 20);
-// 2) same shape — k_cjk calibrated → live should read ≈100
-await simulateTurn("zh-t2", 0, 100, 20);
-// 3) english answer only (thinking off) — k_latin gets calibrated
-await simulateTurn("en-t3", 0, 100, 20);
-// 4) realistic: english thinking 50 + chinese answer 50 (1:1)
-await simulateTurn("mix-t4", 50, 50, 20);
-// 5) RATIO FLIP: short thinking 10 + long chinese answer 90.
-//    A single global k chases the ratio and drifts here; per-class k should hold.
-await simulateTurn("flip-t5", 10, 90, 20);
-// 6) another flip back: long thinking 90 + short answer 10
-await simulateTurn("flip-t6", 90, 10, 20);
+// Calibration sequence (single-call rounds)
+await simulateRound("zh-t1 ", [ { thinking: 0, answer: 100 } ]);
+await simulateRound("zh-t2 ", [ { thinking: 0, answer: 100 } ]);
+await simulateRound("en-t3 ", [ { thinking: 0, answer: 100 } ]);
+await simulateRound("mix-t4", [ { thinking: 50, answer: 50 } ]);
+await simulateRound("flip-t5", [ { thinking: 10, answer: 90 } ]);
+await simulateRound("flip-t6", [ { thinking: 90, answer: 10 } ]);
+console.log("");
 
-// ── Per-turn independence (regression assertions) ───────────────────────
-// Stats of turn N must come only from turn N — never accumulated from
-// earlier turns. Capture every status write during each turn and assert.
-const writes: string[] = [];
-const origSetStatus = ctx.ui.setStatus;
-ctx.ui.setStatus = (k: string, t: string) => {
-	origSetStatus(k, t);
-	writes.push(t);
-};
-const downTok = (s: string | null) => {
-	const m = s?.match(/↓(\d+)/);
-	return m ? parseInt(m[1], 10) : null;
-};
-let failed = 0;
-const check = (label: string, got: number | null, want: number) => {
-	const ok = got === want;
-	if (!ok) failed++;
-	console.log(`[assert] ${label}: ↓${got} (want ${want}) ${ok ? "PASS" : "FAIL"}`);
-};
-
-// X: big turn (30 thinking + 70 answer = 100 tokens)
-const x = await simulateTurn("X-big  ", 30, 70, 20);
-check("X final (own turn only)", downTok(lastStatus), 100);
-check("X during bash (exact, no ~ drift)", downTok(x.duringTools), 100);
-
-// Y: small turn right after — must show 10, not 100+10; live must never
-// climb toward the previous turn's total.
-writes.length = 0;
-await simulateTurn("Y-small", 5, 5, 20);
-check("Y final (own turn only)", downTok(lastStatus), 10);
-const yLives = writes.map(downTok).filter((v): v is number => v !== null);
-if (yLives.length > 0) {
-	const maxLive = Math.max(...yLives);
-	const ok = maxLive <= 14;
-	if (!ok) failed++;
-	console.log(`[assert] Y live max ↓${maxLive} (want ≤14) ${ok ? "PASS" : "FAIL"}`);
-} else {
-	failed++;
-	console.log("[assert] Y live max: no live samples FAIL");
-}
-
-// Interrupted turn with partial usage (40), then Z — Z must not inherit it.
-await emit("turn_start", { turnIndex: 10, timestamp: Date.now() });
-await emit("message_start", { message: mkAssistant() });
-for (let i = 0; i < 20; i++) {
+// ── A1: TTFT anchored at first assistant message_start, NOT agent_start ──
+{
+	// 400ms of "local pipeline" (extension hooks / compaction) between
+	// agent_start and the request actually going out.
+	const tAgentStart = Date.now();
+	await emit("agent_start", {});
+	await sleep(400);
+	const tMsgStart = Date.now();
+	await emit("message_start", { message: mkAssistant() });
 	await sleep(20);
-	await emit("message_update", {
-		message: mkAssistant(),
-		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "汉字", partial: {} },
-	});
+	const tFirstDelta = Date.now();
+	for (let i = 0; i < 10; i++) {
+		await delta("text_delta", "汉字");
+		await sleep(20);
+	}
+	await emit("message_end", { message: mkAssistant(10, "stop") });
+	await emit("agent_end", { messages: [mkAssistant(10, "stop")] });
+	const shown = ttftMs(lastStatus);
+	const want = tFirstDelta - tMsgStart;
+	const fromAgentStart = tFirstDelta - tAgentStart;
+	console.log(`[A1 ttft] shown: ${shown}ms | msgStart→firstDelta: ${want}ms | agentStart→firstDelta: ${fromAgentStart}ms`);
+	check("A1 TTFT ≈ msgStart→firstDelta (not agentStart-based)", shown, want, 5);
+	checkTrue("A1 TTFT excludes the 400ms local pipeline", shown !== null && shown < 200, `shown=${shown}`);
 }
-await emit("turn_end", {
-	turnIndex: 10,
-	message: mkAssistant(40), // partial usage
-	outcome: "aborted",
-	toolResults: [],
-});
-check("aborted final (own partial usage)", downTok(lastStatus), 40);
 
-await simulateTurn("Z-small", 0, 5, 20);
-check("Z final (no inheritance from aborted 40)", downTok(lastStatus), 5);
-
-// Next turn_start must NOT jump to the skeleton when the previous turn
-// had data — keep the previous final display; first delta jumps to live.
-const prevFinal = lastStatus;
-await emit("turn_start", { turnIndex: 11, timestamp: Date.now() });
+// ── A2/A3: multi-call round (bash between two LLM calls) ────────────────
 {
-	const ok = lastStatus === prevFinal;
-	if (!ok) failed++;
-	console.log(`[assert] turn_start keeps previous display: ${lastStatus} ${ok ? "PASS" : "FAIL"}`);
+	const r = await simulateRound("A2 multi", [
+		{ thinking: 10, answer: 10, stopReason: "toolUse", toolMs: 60 },
+		{ thinking: 5, answer: 5 },
+	]);
+	check("A2 final = BOTH calls (20+10)", downTok(r.final), 30);
+	check("A3 exact while bash runs (call 1 only, 20)", downTok(r.duringTools), 20);
+	// Live counts from call 2 onward must never drop below call 1's 20
+	// (call 1's OWN live display legitimately starts at ↓1).
+	const duringIdx = r.duringTools !== null ? r.writes.indexOf(r.duringTools) : -1;
+	const afterLives = r.writes.slice(duringIdx + 1).map(downTok).filter((v): v is number => v !== null);
+	const minAfter = afterLives.length ? Math.min(...afterLives) : 0;
+	checkTrue("A3 live never drops mid-round (min ≥ 20)", afterLives.length > 0 && minAfter >= 20, `min=${minAfter} n=${afterLives.length}`);
 }
-await emit("message_start", { message: mkAssistant() });
-await sleep(20);
-await emit("message_update", {
-	message: mkAssistant(),
-	assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "abcd", partial: {} },
-});
+
+// ── A4: per-round independence ──────────────────────────────────────────
 {
-	const s = lastStatus ?? "";
-	const isLive = /↓\d/.test(s) && /(t\/s)/.test(s) && s !== prevFinal;
-	if (!isLive) failed++;
-	console.log(`[assert] first delta jumps to live: ${s} ${isLive ? "PASS" : "FAIL"}`);
+	const x = await simulateRound("A4 X-big ", [{ thinking: 30, answer: 70 }]);
+	check("A4 X final (own round only)", downTok(x.final), 100);
+	const y = await simulateRound("A4 Y-small", [{ thinking: 5, answer: 5 }]);
+	check("A4 Y final (no X inheritance)", downTok(y.final), 10);
+	const yLives = y.writes.map(downTok).filter((v): v is number => v !== null);
+	const maxLive = yLives.length ? Math.max(...yLives) : 0;
+	checkTrue("A4 Y live max ≤ 14", maxLive <= 14, `max=${maxLive}`);
 }
-await emit("message_end", { message: mkAssistant(1, "stop") });
-await emit("turn_end", {
-	turnIndex: 11,
-	message: mkAssistant(1),
-	outcome: "completed",
-	toolResults: [],
-});
 
-ctx.ui.setStatus = origSetStatus;
-console.log(failed === 0 ? "\nAll independence assertions PASS.\n" : `\n${failed} ASSERTION(S) FAILED\n`);
-
-// Aborted mid-stream (no message_end; provider sent partial usage).
-await emit("turn_start", { turnIndex: 7, timestamp: Date.now() });
-await emit("message_start", { message: mkAssistant() });
-for (let i = 0; i < 20; i++) {
-	await new Promise((r) => setTimeout(r, 20));
-	await emit("message_update", {
-		message: mkAssistant(),
-		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "汉字", partial: {} },
-	});
+// ── A5: aborted round shows partial usage, next round is clean ─────────
+{
+	await emit("agent_start", {});
+	await emit("message_start", { message: mkAssistant() });
+	for (let i = 0; i < 20; i++) {
+		await delta("text_delta", "汉字");
+		await sleep(20);
+	}
+	await emit("message_end", { message: mkAssistant(40, "aborted") });
+	await emit("agent_end", { messages: [mkAssistant(40, "aborted")] });
+	check("A5 aborted final (partial usage)", downTok(lastStatus), 40);
+	checkTrue("A5 shows 'interrupted'", /interrupted/.test(plain(lastStatus)), plain(lastStatus));
+	const z = await simulateRound("A5 Z-small", [{ thinking: 0, answer: 5 }]);
+	check("A5 Z final (no inheritance from aborted 40)", downTok(z.final), 5);
 }
-await emit("turn_end", {
-	turnIndex: 7,
-	message: mkAssistant(40), // partial usage
-	outcome: "aborted",
-	toolResults: [],
-});
-console.log(`[abrt ] aborted                     | final: ${lastStatus}`);
 
-// Zero-output turn → warning skeleton.
-await emit("turn_start", { turnIndex: 8, timestamp: Date.now() });
-await emit("turn_end", {
-	turnIndex: 8,
-	message: mkAssistant(0),
-	outcome: "completed",
-	toolResults: [],
-});
-console.log(`[n/a  ] zero-output turn            | final: ${lastStatus}`);
+// ── A6: keep-last-display across rounds; first delta jumps to live ─────
+{
+	const prevFinal = lastStatus;
+	await emit("agent_start", {});
+	checkTrue("A6 agent_start keeps previous display", lastStatus === prevFinal, `${plain(lastStatus)}`);
+	await emit("message_start", { message: mkAssistant() });
+	await sleep(20);
+	await delta("text_delta", "abcd");
+	const s = plain(lastStatus ?? "");
+	checkTrue("A6 first delta jumps to live", /↓\d/.test(s) && /t\/s/.test(s) && lastStatus !== prevFinal, s);
+	await emit("message_end", { message: mkAssistant(1, "stop") });
+	await emit("agent_end", { messages: [mkAssistant(1, "stop")] });
+}
 
-// /tps toggle: OFF clears; ON restores (no-data → skeleton).
+// ── Zero-output round → warning skeleton ────────────────────────────────
+{
+	await emit("agent_start", {});
+	await emit("agent_end", { messages: [{ role: "user", content: "hi" }] });
+	checkTrue("zero-output round → ghost fields", /TTFT –/.test(plain(lastStatus)), plain(lastStatus ?? ""));
+}
+
+// ── /tps toggle: OFF clears; ON restores (no data → skeleton) ──────────
 await commands.tps.handler("", ctx);
 await commands.tps.handler("", ctx);
-console.log(`[on   ] no data → skeleton          | ${lastStatus}`);
+checkTrue("toggle ON with no data → skeleton", /TTFT –/.test(plain(lastStatus)), plain(lastStatus ?? ""));
 
-// mid-turn toggle restore
-await emit("turn_start", { turnIndex: 9, timestamp: Date.now() });
+// mid-round toggle restore
+await emit("agent_start", {});
 await emit("message_start", { message: mkAssistant() });
 for (let i = 0; i < 30; i++) {
-	await new Promise((r) => setTimeout(r, 20));
-	await emit("message_update", {
-		message: mkAssistant(),
-		assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "abcd", partial: {} },
-	});
+	await delta("thinking_delta", "abcd");
+	await sleep(20);
 }
-await commands.tps.handler("", ctx); // off mid-turn
-await commands.tps.handler("", ctx); // on mid-turn → live display restored
-console.log(`[on   ] mid-turn restore            | ${lastStatus}`);
+await commands.tps.handler("", ctx); // off mid-round
+await commands.tps.handler("", ctx); // on mid-round → live display restored
+checkTrue("mid-round restore → live", /t\/s/.test(plain(lastStatus)) && /↓\d/.test(plain(lastStatus)), plain(lastStatus ?? ""));
 await emit("message_end", { message: mkAssistant(30) });
-await emit("turn_end", { turnIndex: 9, message: mkAssistant(30), outcome: "completed", toolResults: [] });
+await emit("agent_end", { messages: [mkAssistant(30, "stop")] });
 
 // session boundary resets calibration → fresh skeleton
 handlers["session_shutdown"]?.({} as any, ctx);
 await emit("session_start", { reason: "new" });
 console.log(`[idle ] after reset                 | ${lastStatus}\n`);
 console.log("OK — all phases rendered.");
+console.log(failed === 0 ? "All assertions PASS." : `${failed} ASSERTION(S) FAILED`);
 if (failed > 0) process.exitCode = 1;

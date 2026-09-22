@@ -7,18 +7,22 @@
  *
  * Status lifecycle — ONE slot ("speed"), ONE layout in every phase
  * (icon · TTFT · ↓tokens · rate), timer-free → no stale-ctx crashes.
+ * Stats are per ROUND (one user prompt's agent loop: agent_start →
+ * agent_end) and span ALL its LLM calls — pi's "turn" is narrower (one
+ * LLM call + its tool batch), so mid-round turn_start resets nothing.
  * The slot is ALWAYS occupied — no blank, no structure breaks:
  *   idle (no previous data)
  *                     ⚡ TTFT – ↓– –t/s                   (ghost fields)
  *   live (streaming)  ⚡ TTFT 312ms ↓128 ~42t/s           (live estimate)
- *   message done      ⚡ TTFT 312ms ↓456 78.9t/s          (exact final)
- *                    — stays visible while the turn's tools (bash) run AND
- *                      across the gap until the next segment starts
- *                      streaming (keep-last-display, like between rounds);
- *   aborted turn      ⚡ ↓83 interrupted                  (coral)
- *   turn, no data     ⚡ TTFT – ↓– –t/s                   (coral ghost)
- * A new turn never resets a previous turn's display — the next segment's
- * first delta simply jumps straight to live numbers.
+ *   message done      ⚡ TTFT 312ms ↓456 78.9t/s          (exact so far)
+ *                    — stays visible while that message's tools (bash)
+ *                      run and across the gap until the round's next
+ *                      LLM call streams (keep-last-display between
+ *                      rounds, too);
+ *   aborted round     ⚡ ↓83 interrupted                  (coral)
+ *   round, no data    ⚡ TTFT – ↓– –t/s                   (coral ghost)
+ * A new round never resets a previous round's display — its first
+ * delta jumps straight to live numbers.
  *
  * Unified color rule: icon = accent (theme's orange, always); TTFT = warm
  * sand; ↓tokens = champagne gold; rate = soft jade (bold, the "money
@@ -44,10 +48,15 @@
  *     so the thinking:answer ratio flipping between messages does NOT
  *     drag one class's factor with the other's.
  *   - Live rate = token-weighted rolling 2s window (marked with ~).
- *   - Final rate = EXACT output tokens (usage.output, includes thinking
- *     and tool-call tokens) / EXACT stream span (first → last delta).
- *     text, thinking AND toolcall deltas are all counted, matching
- *     what usage.output covers.
+ *   - Final rate = EXACT round output tokens (usage.output, includes
+ *     thinking and tool-call tokens) ÷ PURE streaming time (sum of each
+ *     message's first→last delta span; tool runs and inter-call gaps
+ *     are excluded). text, thinking AND toolcall deltas are all counted,
+ *     matching what usage.output covers.
+ *   - TTFT = request dispatch (first assistant message_start of the
+ *     round) → first token. Local pre-request pipeline time (extension
+ *     hooks, compaction) is deliberately excluded — it is not "waiting
+ *     for the model".
  *
  * Command:
  *   /tps   toggle the status display on/off
@@ -192,14 +201,19 @@ let kLatin = 1; // correction for latin/code content
 let hasCalCjk = false;
 let hasCalLatin = false;
 
-// per-turn
-let turnStartedAt = 0;
-let turnFirstDeltaAt: number | undefined;
-let turnLastDeltaAt: number | undefined;
-let turnOutputTokens = 0; // Σ usage.output of the turn's assistant message(s)
-let turnSawMsgEnd = false;
-let turnActive = false;
-let lastCompleted = true; // outcome of the most recent turn_end (for /tps restore)
+// per-round (one user prompt's agent loop: agent_start … agent_end).
+// NOTE: pi's "turn" is NARROWER — agent-loop.js emits turn_start/turn_end
+// around EACH LLM call + its tool batch, so one round may contain several
+// turns. All stats below span the whole round and must never be reset on
+// turn_start (that would wipe mid-round state between calls).
+let roundMsgStartAt: number | undefined; // first assistant message_start (request dispatch) — TTFT anchor
+let roundFirstDeltaAt: number | undefined;
+let roundLastDeltaAt: number | undefined;
+let roundOutputTokens = 0; // Σ usage.output of the round's assistant messages
+let roundStreamSpanMs = 0; // Σ (lastDelta - firstDelta) per message — pure streaming time
+let roundSawMsgEnd = false;
+let roundActive = false;
+let lastCompleted = true; // outcome of the most recent agent_end (for /tps restore)
 
 // per-message (current streaming message)
 let msgEstCJK = 0; // CJK chars / CPT_CJK so far in this message
@@ -209,21 +223,22 @@ let msgLastDeltaAt: number | undefined;
 let msgEvents: { t: number; estCJK: number; estLatin: number }[] = [];
 let lastRenderAt = 0;
 
-function resetTurn() {
-	turnStartedAt = Date.now();
-	turnFirstDeltaAt = undefined;
-	turnLastDeltaAt = undefined;
-	turnOutputTokens = 0;
-	turnSawMsgEnd = false;
+function resetRound() {
+	roundMsgStartAt = undefined;
+	roundFirstDeltaAt = undefined;
+	roundLastDeltaAt = undefined;
+	roundOutputTokens = 0;
+	roundStreamSpanMs = 0;
+	roundSawMsgEnd = false;
 	lastRenderAt = 0; // first live render fires immediately
 	resetMessage();
 }
 
-function hasTurnData(): boolean {
+function hasRoundData(): boolean {
 	return (
-		turnOutputTokens > 0 &&
-		turnFirstDeltaAt !== undefined &&
-		turnLastDeltaAt !== undefined
+		roundOutputTokens > 0 &&
+		roundFirstDeltaAt !== undefined &&
+		roundLastDeltaAt !== undefined
 	);
 }
 
@@ -240,13 +255,14 @@ function resetAll() {
 	kLatin = 1;
 	hasCalCjk = false;
 	hasCalLatin = false;
-	turnActive = false;
+	roundActive = false;
 	lastCompleted = true;
-	turnStartedAt = 0;
-	turnFirstDeltaAt = undefined;
-	turnLastDeltaAt = undefined;
-	turnOutputTokens = 0;
-	turnSawMsgEnd = false;
+	roundMsgStartAt = undefined;
+	roundFirstDeltaAt = undefined;
+	roundLastDeltaAt = undefined;
+	roundOutputTokens = 0;
+	roundStreamSpanMs = 0;
+	roundSawMsgEnd = false;
 	resetMessage();
 	lastRenderAt = 0;
 }
@@ -375,12 +391,20 @@ function renderWaiting(ctx: SpeedCtx) {
 }
 
 function renderLive(ctx: SpeedCtx, now: number) {
-	if (!displayEnabled || !ctx.hasUI || turnFirstDeltaAt === undefined) return;
+	if (!displayEnabled || !ctx.hasUI || roundFirstDeltaAt === undefined) return;
 	if (now - lastRenderAt < RENDER_THROTTLE_MS) return;
 	lastRenderAt = now;
 	const paint = getPaint(ctx.ui.theme);
-	const ttft = paint("sand", `TTFT ${turnFirstDeltaAt - turnStartedAt}ms`);
-	const tok = paint("gold", `↓${Math.max(1, Math.round(estTokens()))}`);
+	// TTFT = request dispatch (first assistant message_start) → first
+	// token. Local pre-request pipeline time (extension hooks, compaction
+	// etc.) is deliberately excluded — it is not "waiting for the model".
+	const ttft =
+		roundMsgStartAt !== undefined
+			? paint("sand", `TTFT ${roundFirstDeltaAt - roundMsgStartAt}ms`)
+			: paint("sand", "TTFT –", { ghost: true });
+	// Tokens = completed messages of the round + current message estimate
+	// (no mid-round reset, so the count only ever climbs within a round).
+	const tok = paint("gold", `↓${Math.max(1, Math.round(roundOutputTokens + estTokens()))}`);
 	const tps = rollingTps(now);
 	const rate =
 		tps !== null
@@ -394,11 +418,11 @@ function renderFinal(ctx: SpeedCtx, completed: boolean) {
 	const paint = getPaint(ctx.ui.theme);
 
 	if (!completed) {
-		// Aborted/error turn: show what we have (estimate if no usage yet)
+		// Aborted/error round: show what we have (estimate if no usage yet)
 		const est = Math.round(estTokens());
 		const tok =
-			turnOutputTokens > 0
-				? paint("gold", `↓${turnOutputTokens}`)
+			roundOutputTokens > 0
+				? paint("gold", `↓${roundOutputTokens}`)
 				: est > 0
 					? paint("gold", `↓${est}`)
 					: null;
@@ -410,15 +434,19 @@ function renderFinal(ctx: SpeedCtx, completed: boolean) {
 		return;
 	}
 
-	const spanMs =
-		turnFirstDeltaAt !== undefined && turnLastDeltaAt !== undefined
-			? turnLastDeltaAt - turnFirstDeltaAt
-			: 0;
-	if (turnOutputTokens > 0 && spanMs > 0 && turnFirstDeltaAt !== undefined) {
-		const tps = turnOutputTokens / (spanMs / 1000);
-		const ttft = paint("sand", `TTFT ${turnFirstDeltaAt - turnStartedAt}ms`);
-		const tok = paint("gold", `↓${turnOutputTokens}`);
-		const rate = paint("jade", `${tps.toFixed(1)}t/s`, { bold: true });
+	// Final rate = exact round tokens ÷ pure streaming time (sum of each
+	// message's first→last delta span; tool execution and inter-call gaps
+	// are excluded, matching what the live rate measures).
+	const ttft =
+		roundMsgStartAt !== undefined && roundFirstDeltaAt !== undefined
+			? paint("sand", `TTFT ${roundFirstDeltaAt - roundMsgStartAt}ms`)
+			: paint("sand", "TTFT –", { ghost: true });
+	const tok = paint("gold", `↓${roundOutputTokens}`);
+	const rate =
+		roundStreamSpanMs > 0
+			? paint("jade", `${(roundOutputTokens / (roundStreamSpanMs / 1000)).toFixed(1)}t/s`, { bold: true })
+			: paint("jade", "–t/s", { ghost: true });
+	if (roundOutputTokens > 0) {
 		ctx.ui.setStatus(STATUS_KEY, `${iconOf(ctx)} ${ttft} ${tok} ${rate}`);
 		return;
 	}
@@ -436,20 +464,27 @@ export default function piSpeedline(pi: ExtensionAPI) {
 		resetAll();
 	});
 
-	pi.on("turn_start", async (_event, ctx) => {
-		// Same logic as between conversation rounds: keep the previous
-		// turn's final display on screen and jump straight to live numbers
-		// when the new segment starts streaming. The skeleton is only
-		// shown when there is NO previous data to keep (fresh session,
-		// or a zero-output previous turn).
-		const hadPreviousData = hasTurnData();
-		resetTurn();
-		turnActive = true;
+	// A round = one user prompt's agent loop (agent_start … agent_end).
+	// pi's "turn" is narrower (each LLM call + its tool batch), so rounds
+	// are NOT reset on turn_start — that would wipe stats mid-round
+	// between calls. (Verified against pi 0.87.0's agent-loop.js.)
+	pi.on("agent_start", async (_event, ctx) => {
+		// Keep the previous round's final display on screen; the first
+		// delta of the new round jumps straight to live. The skeleton is
+		// only shown when there is NO previous data to keep (fresh
+		// session, or a zero-output previous round).
+		const hadPreviousData = hasRoundData();
+		resetRound();
+		roundActive = true;
 		if (!hadPreviousData) renderWaiting(ctx);
 	});
 
 	pi.on("message_start", async (event) => {
-		if (event.message?.role === "assistant") resetMessage();
+		if (event.message?.role !== "assistant") return;
+		// TTFT anchor: the first assistant message_start of the round is
+		// when the request actually goes out (stream begins).
+		if (roundMsgStartAt === undefined) roundMsgStartAt = Date.now();
+		resetMessage();
 	});
 
 	pi.on("message_update", async (event, ctx) => {
@@ -465,8 +500,8 @@ export default function piSpeedline(pi: ExtensionAPI) {
 		msgEstLatin += estLatin;
 		if (msgFirstDeltaAt === undefined) msgFirstDeltaAt = now;
 		msgLastDeltaAt = now;
-		if (turnFirstDeltaAt === undefined) turnFirstDeltaAt = now;
-		turnLastDeltaAt = now;
+		if (roundFirstDeltaAt === undefined) roundFirstDeltaAt = now;
+		roundLastDeltaAt = now;
 		msgEvents.push({ t: now, estCJK, estLatin });
 		renderLive(ctx, now);
 	});
@@ -474,33 +509,47 @@ export default function piSpeedline(pi: ExtensionAPI) {
 	pi.on("message_end", async (event, ctx) => {
 		const m = event.message;
 		if (m?.role !== "assistant") return;
+		if (msgFirstDeltaAt !== undefined && msgLastDeltaAt !== undefined) {
+			// Accumulate this message's pure streaming time (tool runs and
+			// inter-call gaps stay out of the final rate).
+			roundStreamSpanMs += msgLastDeltaAt - msgFirstDeltaAt;
+		}
 		const out = m.usage?.output ?? 0;
 		if (out > 0) {
-			turnOutputTokens += out;
-			turnSawMsgEnd = true;
+			roundOutputTokens += out;
+			roundSawMsgEnd = true;
 			calibrate(out);
 		}
-		// A turn = one LLM response + its tool calls, so as soon as the
-		// message completes normally we already have the turn's exact
-		// stats. Render the final line NOW — it then stays on screen
-		// during the turn's tool execution (bash) instead of showing a
-		// frozen live estimate. turn_end re-renders (same value) or shows
-		// the interrupted state if the turn ended badly.
+		// As soon as a message completes normally we have exact stats for
+		// everything streamed so far. Render the exact line NOW — it then
+		// stays on screen during the message's tool execution (bash) and
+		// across the gap until the round's next LLM call, instead of
+		// showing a frozen live estimate.
 		if (m.stopReason === "stop" || m.stopReason === "length" || m.stopReason === "toolUse") {
 			renderFinal(ctx, true);
 		}
 	});
 
-	pi.on("turn_end", async (event, ctx) => {
-		const completed = event.outcome === "completed";
-		const m = event.message;
-		// Aborted turn: message_end may never have fired — fall back to
-		// whatever usage the final message carries.
-		if (!turnSawMsgEnd && m?.role === "assistant" && m.usage?.output) {
-			turnOutputTokens += m.usage.output;
+	pi.on("agent_end", async (event, ctx) => {
+		// The round is over. Interrupted = the round's last assistant
+		// message ended in "aborted"/"error" (or no assistant message at
+		// all).
+		const msgs = (event.messages ?? []) as any[];
+		let lastStop: string | undefined;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			if (msgs[i]!.role === "assistant") {
+				lastStop = msgs[i]!.stopReason;
+				// Aborted round: message_end may never have fired — fall
+				// back to whatever usage the final message carries.
+				if (!roundSawMsgEnd && msgs[i]!.usage?.output) {
+					roundOutputTokens += msgs[i]!.usage.output;
+				}
+				break;
+			}
 		}
+		const completed = lastStop === "stop" || lastStop === "length" || lastStop === "toolUse";
 		renderFinal(ctx, completed);
-		turnActive = false;
+		roundActive = false;
 		lastCompleted = completed;
 	});
 
@@ -514,14 +563,14 @@ export default function piSpeedline(pi: ExtensionAPI) {
 			} else {
 				if (ctx.hasUI) {
 					// Restore the display to the current state
-					if (turnActive) {
-						if (turnFirstDeltaAt !== undefined) {
+					if (roundActive) {
+						if (roundFirstDeltaAt !== undefined) {
 							lastRenderAt = 0; // bypass throttle
 							renderLive(ctx, Date.now());
 						} else {
 							renderWaiting(ctx);
 						}
-					} else if (hasTurnData()) {
+					} else if (hasRoundData()) {
 						renderFinal(ctx, lastCompleted);
 					} else {
 						renderWaiting(ctx);
