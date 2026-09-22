@@ -21,8 +21,10 @@
  *   latin = 4.0 chars/token (delta "abcd" = 1 token)
  *
  * Regression assertions:
- *   A1  TTFT is anchored at the first assistant message_start of the
- *       round — NOT at agent_start (local pipeline time excluded)
+ *   A1  TTFT is anchored at before_provider_request (request dispatch) —
+ *       NOT at agent_start (local pipeline excluded), NOT at
+ *       message_start (pi fires that at the first SSE event ≈ first
+ *       token, which would measure ~0)
  *   A2  a multi-call round accumulates (no mid-round wipe)
  *   A3  exact values shown while tools run; live count never drops
  *   A4  per-round independence (no cross-round accumulation)
@@ -104,11 +106,14 @@ async function delta(type: "thinking_delta" | "text_delta" | "toolcall_delta", d
 }
 
 /**
- * One LLM call: message_start → `thinking` latin deltas → `answer` CJK
- * deltas (stepMs apart) → message_end with real usage = thinking+answer.
- * Returns exact wall-clock anchors (same Date.now clock as the extension).
+ * One LLM call: before_provider_request → (requestMs of "network+
+ * prefill") → message_start (first SSE) → `thinking` latin deltas →
+ * `answer` CJK deltas (stepMs apart) → message_end with real usage.
  */
-async function simulateCall(thinking: number, answer: number, stepMs: number, stopReason: string) {
+async function simulateCall(thinking: number, answer: number, stepMs: number, stopReason: string, requestMs = 10) {
+	const tRequest = Date.now();
+	await emit("before_provider_request", { payload: {} });
+	await sleep(requestMs);
 	const tMsgStart = Date.now();
 	await emit("message_start", { message: mkAssistant() });
 	await sleep(stepMs);
@@ -124,7 +129,7 @@ async function simulateCall(thinking: number, answer: number, stepMs: number, st
 	const live = lastStatus;
 	const real = thinking + answer;
 	await emit("message_end", { message: mkAssistant(real, stopReason) });
-	return { tMsgStart, tFirstDelta, live, during: lastStatus };
+	return { tRequest, tMsgStart, tFirstDelta, live, during: lastStatus };
 }
 
 interface CallSpec {
@@ -182,14 +187,17 @@ await simulateRound("flip-t5", [ { thinking: 10, answer: 90 } ]);
 await simulateRound("flip-t6", [ { thinking: 90, answer: 10 } ]);
 console.log("");
 
-// ── A1: TTFT anchored at first assistant message_start, NOT agent_start ──
+// ── A1: TTFT anchored at before_provider_request (request dispatch) ──
 {
 	// 400ms of "local pipeline" (extension hooks / compaction) between
-	// agent_start and the request actually going out.
+	// agent_start and the request going out, then 30ms of "network +
+	// prefill" before the first SSE/first token.
 	const tAgentStart = Date.now();
 	await emit("agent_start", {});
 	await sleep(400);
-	const tMsgStart = Date.now();
+	const tRequest = Date.now();
+	await emit("before_provider_request", { payload: {} });
+	await sleep(30);
 	await emit("message_start", { message: mkAssistant() });
 	await sleep(20);
 	const tFirstDelta = Date.now();
@@ -200,10 +208,10 @@ console.log("");
 	await emit("message_end", { message: mkAssistant(10, "stop") });
 	await emit("agent_end", { messages: [mkAssistant(10, "stop")] });
 	const shown = ttftMs(lastStatus);
-	const want = tFirstDelta - tMsgStart;
+	const want = tFirstDelta - tRequest;
 	const fromAgentStart = tFirstDelta - tAgentStart;
-	console.log(`[A1 ttft] shown: ${shown}ms | msgStart→firstDelta: ${want}ms | agentStart→firstDelta: ${fromAgentStart}ms`);
-	check("A1 TTFT ≈ msgStart→firstDelta (not agentStart-based)", shown, want, 5);
+	console.log(`[A1 ttft] shown: ${shown}ms | request→firstDelta: ${want}ms | agentStart→firstDelta: ${fromAgentStart}ms`);
+	check("A1 TTFT ≈ request→firstDelta", shown, want, 5);
 	checkTrue("A1 TTFT excludes the 400ms local pipeline", shown !== null && shown < 200, `shown=${shown}`);
 }
 

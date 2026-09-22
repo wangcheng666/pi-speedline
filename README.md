@@ -90,10 +90,12 @@ converge, so the footer never shows two contradictory numbers:
   tool-call tokens, matching `usage.output`) ÷ pure streaming time (sum
   of each message's first→last delta span; tool runs and inter-call
   gaps are excluded, matching what the live rate measures).
-- **TTFT** — request dispatch (the round's first assistant
-  `message_start`) → first token. Local pre-request pipeline time
-  (extension hooks, compaction, queueing) is deliberately excluded —
-  that is not "waiting for the model".
+- **TTFT** — request dispatch (the round's first
+  `before_provider_request`) → first token: the real network +
+  prefill wait. Local pre-request pipeline time (extension hooks,
+  compaction, queueing) is deliberately excluded. (Note: pi's assistant
+  `message_start` fires at the FIRST SSE event — ≈ the first token —
+  so it cannot measure TTFT.)
 
 Result: first message of a session carries the prior (±20% for CJK),
 after one calibration round typical error is <5% — even across ratio
@@ -140,7 +142,8 @@ chars/token, latin 4.0) and replays the REAL pi 0.87.0 event stream
 (`agent_start` … `turn_start` … `message_start` … tool runs … `agent_end`).
 It asserts: live-vs-final convergence, ratio flips, per-round
 independence, multi-call rounds (no mid-round reset), tool-phase exact
-display, TTFT anchored at request dispatch (local pipeline excluded),
+display, TTFT anchored at request dispatch (local pipeline excluded —
+and NOT at message_start, which pi fires at the first SSE event),
 keep-last-display, and skeleton/restore behavior.
 
 ## Credits
@@ -164,8 +167,10 @@ pi 的统一速度表:流式输出时显示**校准后的实时 tokens/s**,输�
 (`k_cjk` / `k_latin`)——思考(英文)和回答(中文)比例怎么翻转都不会互相
 干扰,一条消息后误差通常 <5%。实时速率是 2 秒滚动窗口(带 `~`),最终
 速率 = 整轮真实 output token ÷ 纯流式时长(工具执行和调用间隙不算)。
-**TTFT = 请求实际发出(首个 assistant message_start)→ 首 token**,不含
-本地预处理(扩展钩子/压缩)时间——那不是在等模型。
+**TTFT = 请求发出(before_provider_request)→ 首 token**,即真实的
+网络+prefill 等待;本地预处理(扩展钩子/压缩)时间不算。
+(注意:pi 的 assistant message_start 是在 SSE 首包时发的,≈ 首 token
+本身,不能当 TTFT 锚点。)
 
 **显示逻辑**:槽位常驻不空(无数据显示幽灵字段占位);每条消息完成即渲染
 精确值,bash 执行期间保持不动,轮内多次 LLM 调用(如思考→跑命令→总结)

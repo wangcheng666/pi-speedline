@@ -53,10 +53,11 @@
  *     message's first→last delta span; tool runs and inter-call gaps
  *     are excluded). text, thinking AND toolcall deltas are all counted,
  *     matching what usage.output covers.
- *   - TTFT = request dispatch (first assistant message_start of the
+ *   - TTFT = request dispatch (first before_provider_request of the
  *     round) → first token. Local pre-request pipeline time (extension
  *     hooks, compaction) is deliberately excluded — it is not "waiting
- *     for the model".
+ *     for the model". (pi's assistant message_start fires at the first
+ *     SSE event ≈ the first token, so it cannot serve as the anchor.)
  *
  * Command:
  *   /tps   toggle the status display on/off
@@ -206,7 +207,9 @@ let hasCalLatin = false;
 // around EACH LLM call + its tool batch, so one round may contain several
 // turns. All stats below span the whole round and must never be reset on
 // turn_start (that would wipe mid-round state between calls).
-let roundMsgStartAt: number | undefined; // first assistant message_start (request dispatch) — TTFT anchor
+let roundRequestAt: number | undefined; // first before_provider_request of the round — TTFT anchor
+let roundMsgStartAt: number | undefined; // first assistant message_start (fallback only; pi
+// fires it at the FIRST SSE event, i.e. ≈ the first token — never use it as a TTFT anchor)
 let roundFirstDeltaAt: number | undefined;
 let roundLastDeltaAt: number | undefined;
 let roundOutputTokens = 0; // Σ usage.output of the round's assistant messages
@@ -224,6 +227,7 @@ let msgEvents: { t: number; estCJK: number; estLatin: number }[] = [];
 let lastRenderAt = 0;
 
 function resetRound() {
+	roundRequestAt = undefined;
 	roundMsgStartAt = undefined;
 	roundFirstDeltaAt = undefined;
 	roundLastDeltaAt = undefined;
@@ -242,6 +246,15 @@ function hasRoundData(): boolean {
 	);
 }
 
+/**
+ * TTFT anchor: when the round's first provider request went out.
+ * pi's assistant message_start fires at the FIRST SSE event (≈ the first
+ * token itself), so it is only a fallback, never the primary anchor.
+ */
+function ttftAnchor(): number | undefined {
+	return roundRequestAt ?? roundMsgStartAt;
+}
+
 function resetMessage() {
 	msgEstCJK = 0;
 	msgEstLatin = 0;
@@ -257,6 +270,7 @@ function resetAll() {
 	hasCalLatin = false;
 	roundActive = false;
 	lastCompleted = true;
+	roundRequestAt = undefined;
 	roundMsgStartAt = undefined;
 	roundFirstDeltaAt = undefined;
 	roundLastDeltaAt = undefined;
@@ -398,9 +412,10 @@ function renderLive(ctx: SpeedCtx, now: number) {
 	// TTFT = request dispatch (first assistant message_start) → first
 	// token. Local pre-request pipeline time (extension hooks, compaction
 	// etc.) is deliberately excluded — it is not "waiting for the model".
+	const anchor = ttftAnchor();
 	const ttft =
-		roundMsgStartAt !== undefined
-			? paint("sand", `TTFT ${roundFirstDeltaAt - roundMsgStartAt}ms`)
+		anchor !== undefined
+			? paint("sand", `TTFT ${roundFirstDeltaAt - anchor}ms`)
 			: paint("sand", "TTFT –", { ghost: true });
 	// Tokens = completed messages of the round + current message estimate
 	// (no mid-round reset, so the count only ever climbs within a round).
@@ -437,9 +452,10 @@ function renderFinal(ctx: SpeedCtx, completed: boolean) {
 	// Final rate = exact round tokens ÷ pure streaming time (sum of each
 	// message's first→last delta span; tool execution and inter-call gaps
 	// are excluded, matching what the live rate measures).
+	const anchor = ttftAnchor();
 	const ttft =
-		roundMsgStartAt !== undefined && roundFirstDeltaAt !== undefined
-			? paint("sand", `TTFT ${roundFirstDeltaAt - roundMsgStartAt}ms`)
+		roundFirstDeltaAt !== undefined && anchor !== undefined
+			? paint("sand", `TTFT ${roundFirstDeltaAt - anchor}ms`)
 			: paint("sand", "TTFT –", { ghost: true });
 	const tok = paint("gold", `↓${roundOutputTokens}`);
 	const rate =
@@ -479,10 +495,15 @@ export default function piSpeedline(pi: ExtensionAPI) {
 		if (!hadPreviousData) renderWaiting(ctx);
 	});
 
+	// TTFT anchor: before_provider_request fires right before the HTTP
+	// request goes out. (pi's assistant message_start fires at the FIRST
+	// SSE event — ≈ the first token — so it cannot measure TTFT.)
+	pi.on("before_provider_request", async () => {
+		if (roundRequestAt === undefined) roundRequestAt = Date.now();
+	});
+
 	pi.on("message_start", async (event) => {
 		if (event.message?.role !== "assistant") return;
-		// TTFT anchor: the first assistant message_start of the round is
-		// when the request actually goes out (stream begins).
 		if (roundMsgStartAt === undefined) roundMsgStartAt = Date.now();
 		resetMessage();
 	});
