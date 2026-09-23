@@ -1,6 +1,6 @@
 {
   "name": "@qingwawangzi/pi-speedline",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Unified pi speedometer: real-time calibrated tokens/s while streaming + exact per-turn TTFT and throughput in ONE theme-adaptive footer slot. Merges pi-tokens-per-second and pi-throughput-meter, timer-free.",
   "type": "module",
   "license": "MIT",

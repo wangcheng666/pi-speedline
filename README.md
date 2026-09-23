@@ -1,5 +1,9 @@
 # pi-speedline ⚡
 
+<p align="center">
+  <img src="dist/preview.png" alt="pi-speedline footer — live and final TTFT + tokens/s" width="760">
+</p>
+
 **A unified speedometer for the [pi](https://pi.dev) coding agent.**
 
 Real-time calibrated tokens/s while streaming, exact per-round TTFT and
