@@ -180,7 +180,7 @@ pipeline).
 ## Install
 
 ```bash
-pi install npm:pi-speedline
+pi install npm:@qingwawangzi/pi-speedline
 ```
 
 If you use the older meters, remove them (this package replaces both):
@@ -270,6 +270,6 @@ pi 的统一速度表:流式输出时显示**校准后的实时 tokens/s**,输�
 `pi-tokens-per-second` 的崩溃原因)。
 
 ```bash
-pi install npm:pi-speedline    # 安装
+pi install npm:@qingwawangzi/pi-speedline    # 安装
 /tps                           # 开关显示
 ```

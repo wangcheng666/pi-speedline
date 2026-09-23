@@ -1,5 +1,5 @@
 {
-  "name": "pi-speedline",
+  "name": "@qingwawangzi/pi-speedline",
   "version": "0.1.0",
   "description": "Unified pi speedometer: real-time calibrated tokens/s while streaming + exact per-turn TTFT and throughput in ONE theme-adaptive footer slot. Merges pi-tokens-per-second and pi-throughput-meter, timer-free.",
   "type": "module",
@@ -31,7 +31,7 @@
     "extensions": [
       "./extensions"
     ],
-    "image": "https://cdn.jsdelivr.net/npm/pi-speedline@0.1.0/dist/preview.png"
+    "image": "https://cdn.jsdelivr.net/npm/@qingwawangzi/pi-speedline@0.1.0/dist/preview.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.87.0"
